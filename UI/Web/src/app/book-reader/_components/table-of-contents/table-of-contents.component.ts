@@ -12,6 +12,7 @@ import {BookChapterItem} from '../../_models/book-chapter-item';
 import {TranslocoDirective} from "@jsverse/transloco";
 import {LoadingComponent} from "../../../shared/loading/loading.component";
 import {DOCUMENT} from "@angular/common";
+import {BookColumnMapService} from "../../_services/book-column-map.service";
 
 @Component({
   selector: 'app-table-of-contents',
@@ -23,6 +24,7 @@ import {DOCUMENT} from "@angular/common";
 export class TableOfContentsComponent {
 
   private readonly document = inject(DOCUMENT)
+  protected readonly columnMapService = inject(BookColumnMapService);
 
   chapterId = model.required<number>();
   pageNum = model.required<number>();
@@ -60,6 +62,12 @@ export class TableOfContentsComponent {
         }
       }, 10); // Some delay to allow the items to be rendered into the DOM
     });
+  }
+
+  // Book-wide start page for a chapter, or null when there's no committed mapping (e.g. scroll mode).
+  startPageFor(chapter: BookChapterItem): number | null {
+    if (!this.columnMapService.hasCommitted(this.chapterId())) return null;
+    return this.columnMapService.committedStartPage(chapter.page);
   }
 
   cleanIdSelector(id: string) {

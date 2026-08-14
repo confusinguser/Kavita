@@ -157,7 +157,12 @@ export class BookLineOverlayComponent implements OnInit {
         event.stopPropagation();
       }
 
-      if (!isRightClick) {
+      // Don't tear down when re-detecting the same selection (e.g. the extra pointerup of a double-tap).
+      const sameLiveSelection = selection !== null
+        && selection.toString().trim() !== ''
+        && selection.toString().trim() === this.selectedText();
+
+      if (!isRightClick && !sameLiveSelection) {
         this.reset();
       }
       return;

@@ -18,6 +18,9 @@
           @for(chapter of displayedChapters(); track chapter.title) {
             <li [id]="`${$index}`" class="{{isChapterSelected(chapter) ? 'active': ''}}">
               <a href="javascript:void(0);" (click)="loadChapterPage(chapter.page, chapter.part)">{{chapter.title}}</a>
+              @if (startPageFor(chapter); as startPage) {
+                <span class="toc-page">{{t('page-label', {page: startPage})}}</span>
+              }
             </li>
           }
         </ul>
@@ -27,11 +30,17 @@
         <ul [id]="`${$index}`" class="chapter-title">
           <li class="{{isChapterSelected(chapterGroup) ? 'active': ''}}" (click)="loadChapterPage(chapterGroup.page, '')">
             {{chapterGroup.title}}
+            @if (startPageFor(chapterGroup); as startPage) {
+              <span class="toc-page">{{t('page-label', {page: startPage})}}</span>
+            }
           </li>
           @for(chapter of chapterGroup.children; track chapter.title + chapter.part) {
             <ul>
               <li class="{{isAnchorSelected(chapter) ? 'active' : ''}}">
                 <a href="javascript:void(0);" (click)="loadChapterPage(chapter.page, chapter.part)">{{chapter.title}}</a>
+                @if (startPageFor(chapter); as startPage) {
+                  <span class="toc-page">{{t('page-label', {page: startPage})}}</span>
+                }
               </li>
             </ul>
           }

@@ -637,8 +637,6 @@ public class ReaderService(IUnitOfWork unitOfWork, ILogger<ReaderService> logger
         if (series == null || chapter == null)
             throw new KavitaException(await localizationService.TranslateAsync(userId, "generic-error"));
 
-        if (page == chapter.PagesRead) return new HourEstimateRangeDto();
-
         if (series.Format == MangaFormat.Epub)
         {
             // Get the word counts for all the pages

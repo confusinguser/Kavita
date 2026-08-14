@@ -35,14 +35,19 @@
          [ngClass]="{'immersive' : immersiveMode() || !actionBarVisible(), 'is-loading': isLoading()}" (click)="handleReaderClick($event)">
 
 
-      <div #bookContainer class="book-container {{writingStyle() | writingStyleClass}}"
+      <div #bookContainer class="book-container {{layoutMode() | columnLayoutClass}} {{writingStyle() | writingStyleClass}}"
             [ngClass]="{'immersive' : immersiveMode()}"
             (mousedown)="mouseDown($event)" >
 
         <div #readingHtml class="book-content {{layoutMode() | columnLayoutClass}} {{writingStyle() | writingStyleClass}}"
              [ngStyle]="{'max-height': columnHeight(), 'max-width': verticalBookContentWidth(), 'width': verticalBookContentWidth(), 'column-width': columnWidth(), 'padding-bottom': bookContentPaddingBottom()}"
+             [style.transform]="columnTransform()"
              [ngClass]="{'immersive': immersiveMode() && actionBarVisible, 'debug': debugMode()}"
              [innerHtml]="page()" (click)="toggleMenu($event)" (mousedown)="mouseDown($event)" (wheel)="onWheel($event)"></div>
+
+          <!-- Off-screen element used to measure how many column-pages each section spans -->
+          <div #measureContent class="book-content measure-content {{layoutMode() | columnLayoutClass}} {{writingStyle() | writingStyleClass}}"
+               aria-hidden="true"></div>
 
           @if (shouldShowBottomActionBar()) {
             <div class="bottom-bar" (click)="$event.stopPropagation();">
@@ -63,7 +68,7 @@
             </div>
 
             <div class="text-center center-group">
-              @if (isLoading()) {
+              @if (showLoadingUi()) {
                 <div class="spinner-border spinner-border-sm text-primary" style="border-radius: 50%;" role="status">
                   <span class="visually-hidden">{{ t('loading-book') }}</span>
                 </div>
@@ -142,24 +147,25 @@
         </div>
 
 
-        <div class="d-flex mt-2 justify-content-center">
-          @if(!isLoading()) {
+        <div class="d-flex mt-2 justify-content-center align-items-center">
+          @if(!showLoadingUi()) {
             <span class="me-1">
               <a class="btn-link" style="width: 100%" href="javascript:void(0);" (click)="goToPage()" [title]="t('go-to-page')">
-                {{t('page-num-label', {page: virtualizedPageNum() + 1})}}</a> / {{virtualizedMaxPages()}}
+                {{t(pageNumberLabelKey(), {page: virtualizedPageNum() + 1})}}</a> / {{virtualizedMaxPages()}}
             </span>
 
-            <div class="d-none d-sm-block">
+            @if (timeLeftDisplay(); as timeLeft) {
               <span class="dot-separator mx-1"></span>
-              {{t('completion-label', {percent: (virtualizedPageNum() / virtualizedMaxPages()) | percent})}}
-              @if (readingTimeLeftResource.value(); as timeLeft) {
-                <span class="dot-separator mx-1"></span>
-                <span class="time-left">
-                    <i class="fa-solid fa-clock" aria-hidden="true"></i>
-                  {{timeLeft! | readTimeLeft:true }}
-                </span>
-              }
-            </div>
+              <span class="time-left">
+                  <i class="fa-solid fa-clock" aria-hidden="true"></i>
+                {{timeLeft! | readTimeLeft:true }}
+              </span>
+            }
+
+            <span class="d-none d-sm-inline-flex align-items-center">
+              <span class="dot-separator mx-1"></span>
+              {{t('completion-label', {percent: readingFraction() | percent})}}
+            </span>
           }
 
           @if (debugMode()) {
