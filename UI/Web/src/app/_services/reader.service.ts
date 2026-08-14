@@ -269,6 +269,10 @@ export class ReaderService {
     return this.httpClient.get<HourEstimateRange>(this.baseUrl + `reader/time-left-for-chapter?seriesId=${seriesId}&chapterId=${chapterId}`);
   }
 
+  getTimeLeftForChapterFromPage(seriesId: number, chapterId: number, page: number) {
+    return this.httpClient.get<HourEstimateRange>(this.baseUrl + `reader/time-left-for-chapter-from-page?seriesId=${seriesId}&chapterId=${chapterId}&page=${page}`);
+  }
+
   getFirstProgressDateForUser(userId: number) {
     return this.httpClient.get<Date>(this.baseUrl + 'reader/first-progress-date?userId=' + userId);
   }

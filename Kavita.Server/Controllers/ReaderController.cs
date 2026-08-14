@@ -957,6 +957,22 @@ public class ReaderController(ICacheService cacheService,
         return Ok(await readerService.GetEstimateToCompletionForChapter(UserId, seriesId, chapterId));
     }
 
+    /// <summary>
+    /// For the current user, returns an estimate on how long it would take to finish the chapter from a given page.
+    /// </summary>
+    /// <remarks>Unlike time-left-for-chapter, this reflects the current reading position rather than saved progress.</remarks>
+    /// <param name="seriesId"></param>
+    /// <param name="chapterId"></param>
+    /// <param name="page">The page (Epub section) the user is currently on</param>
+    /// <returns></returns>
+    [SeriesAccess]
+    [HttpGet("time-left-for-chapter-from-page")]
+    [ResponseCache(CacheProfileName = ResponseCacheProfiles.Hour, VaryByQueryKeys = ["seriesId", "chapterId", "page"])]
+    public async Task<ActionResult<HourEstimateRangeDto>> GetEstimateFromPageForChapter(int seriesId, int chapterId, int page)
+    {
+        return Ok(await readerService.GetEstimateFromPageForChapter(UserId, seriesId, chapterId, page));
+    }
+
 
 
     /// <summary>

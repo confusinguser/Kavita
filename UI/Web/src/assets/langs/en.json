@@ -1487,6 +1487,7 @@
         "go-to-page-prompt": "There are {{totalPages}} pages. Which page do you want to go to? Page starts at 1.",
 
         "page-num-label": "Page {{page}}",
+        "section-num-label": "Section {{page}}",
         "completion-label": "{{percent}} complete",
 
         "force-selected-one-column": "Layout mode switched to One Column due to insufficient space to render Two Columns",
@@ -2116,7 +2117,8 @@
     },
 
     "table-of-contents": {
-        "no-data": "This book does not have Table of Contents set in the metadata or a toc file"
+        "no-data": "This book does not have Table of Contents set in the metadata or a toc file",
+        "page-label": "p. {{page}}"
     },
 
     "bookmarks": {

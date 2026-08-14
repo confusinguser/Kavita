@@ -40,6 +40,7 @@ import {LibraryService} from 'src/app/_services/library.service';
 import {LibraryType} from 'src/app/_models/library/library';
 import {BookTheme} from 'src/app/_models/preferences/book-theme';
 import {BookPageLayoutMode} from 'src/app/_models/readers/book-page-layout-mode';
+import {HourEstimateRange} from 'src/app/_models/series-detail/hour-estimate-range';
 import {PageStyle} from '../reader-settings/reader-settings.component';
 import {ThemeService} from 'src/app/_services/theme.service';
 import {ScrollService} from 'src/app/_services/scroll.service';
@@ -62,6 +63,7 @@ import {Annotation} from "../../_models/annotations/annotation";
 import {NgxSliderModule} from "@angular-slider/ngx-slider";
 import {ProgressBookmark} from "../../../_models/readers/progress-bookmark";
 import {LayoutMeasurementService} from "../../../_services/layout-measurement.service";
+import {BookColumnMapService} from "../../_services/book-column-map.service";
 import {ColorscapeService} from "../../../_services/colorscape.service";
 import {environment} from "../../../../environments/environment";
 import {LoadPageEvent} from "../_drawers/view-bookmarks-drawer/view-bookmark-drawer.component";
@@ -98,6 +100,19 @@ const pageLevelStyles = ['margin-left', 'margin-right', 'font-size'];
  * Styles that should be applied on every element within book-content tag
  */
 const elementLevelStyles = ['line-height', 'font-family'];
+// Styles copied from the live book-content onto the measurement element so column flow matches the reader.
+const MEASURE_MIRRORED_STYLES = [
+  'column-width', 'column-gap', 'column-fill', 'column-rule',
+  'padding-top', 'padding-bottom', 'padding-left', 'padding-right',
+  'margin-left', 'margin-right', 'font-size', 'font-family', 'line-height',
+  'box-sizing', 'direction', 'writing-mode', 'text-align', 'word-break',
+];
+// How many sections to fetch at once when measuring the book.
+const MEASURE_CONCURRENCY = 8;
+// How long to wait after a layout change before measuring, so rapid changes coalesce.
+const MEASURE_DEBOUNCE = 50;
+// Grace period before the loading UI (header spinner, blank footer) is shown, to avoid a flash on quick loads.
+const LOADING_GRACE = 500;
 
 /**
  * Minimum size to be assigned a bookmark
@@ -162,6 +177,7 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
   private readonly kavitaTitleStrategy = inject(KavitaTitleStrategy);
   private readonly document = inject(DOCUMENT);
   private readonly layoutService = inject(LayoutMeasurementService);
+  protected readonly columnMapService = inject(BookColumnMapService);
   private readonly colorscapeService = inject(ColorscapeService);
   private readonly fontService = inject(FontService);
   private readonly keyBindService = inject(KeyBindService);
@@ -204,6 +220,25 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
    * Max Pages
    */
   maxPages = signal<number>(1);
+  // 1-based screen within the current section, in a column layout mode.
+  currentVirtualPage = signal<number>(1);
+  // Translate offset (px) of the columned content, moved for paging instead of scrolling the viewport.
+  protected readonly columnOffset = signal<number>(0);
+  // Book-wide column (1-based) the footer should show instead of the screen's leftmost, set when jumping to a page.
+  protected readonly displayPageOverride = signal<number | null>(null);
+  // Caches section html so re-measuring on layout changes doesn't re-hit the server.
+  private readonly sectionHtmlCache = new Map<number, string>();
+  // Bumped to cancel an in-flight measuring pass when the layout changes.
+  private measureRunId = 0;
+  private measureDebounceTimeout: any = undefined;
+  // Column page to land on after the next page load, set when jumping to a book-wide page.
+  private pendingVirtualPage: number | undefined = undefined;
+  // Column page captured when the tab is hidden, restored when it becomes visible again.
+  private maskedVirtualPage: number | undefined = undefined;
+  // True while a load will land somewhere other than the start, so we hide the reposition.
+  private maskDuringLoad = false;
+  // Persistent stylesheet applying the element-level styles (line-height, font-family) so content is styled as it renders.
+  private bookStyleSheet?: HTMLStyleElement;
   /**
    * This allows for exploration into different chapters
    */
@@ -230,6 +265,9 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
    * If we are loading from backend
    */
   isLoading = signal<boolean>(true);
+  // True once loading has lasted past a grace period, so quick loads don't flash the header/footer.
+  showLoadingUi = signal<boolean>(false);
+  private loadingUiTimeout: any = undefined;
   /**
    * Title of the book. Rendered in action bar
    */
@@ -304,9 +342,36 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
       pageNumber: this.pageNum(),
     }),
     loader: async ({params}) => {
-      return firstValueFrom(this.readerService.getTimeLeftForChapter(params.seriesId, params.chapterId));
+      return firstValueFrom(this.readerService.getTimeLeftForChapterFromPage(params.seriesId, params.chapterId, params.pageNumber));
     }
   });
+
+  // Keeps the last resolved estimate visible while the resource reloads.
+  private readonly lastTimeLeft = signal<HourEstimateRange | undefined>(undefined);
+
+  // 0..1 progress through the book: the section index plus the intra-section fraction of the current position.
+  readonly readingFraction = signal<number>(0);
+
+  // Scales the per-section backend estimate by how far through the book the position is, so it steps per turn.
+  private readonly timeLeftDisplayRaw = computed<HourEstimateRange | undefined>(() => {
+    const base = this.readingTimeLeftResource.value() ?? this.lastTimeLeft();
+    if (!base) return base;
+
+    const maxPages = this.maxPages();
+    const remainingFromSectionStart = maxPages - this.pageNum();
+    if (maxPages <= 0 || remainingFromSectionStart <= 0) return base;
+
+    const remainingFromPosition = maxPages * (1 - this.readingFraction());
+    const factor = Math.min(1, Math.max(0, remainingFromPosition / remainingFromSectionStart));
+    return {
+      minHours: base.minHours * factor,
+      maxHours: base.maxHours * factor,
+      avgHours: base.avgHours * factor,
+    };
+  });
+
+  // Held steady while a section loads (assigned in the constructor).
+  readonly timeLeftDisplay!: Signal<HourEstimateRange | undefined>;
 
   imageBookmarks = signal<PageBookmark[]>([]);
   annotationToLoad = signal<number>(-1);
@@ -339,6 +404,8 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
     x: 0,
     y: 0
   };
+  // Whether text was selected when the current click started (so a deselect click doesn't toggle the menu).
+  private hadSelectionOnMouseDown = false;
 
   /**
    * Used to keep track of direction user is paging, to help with virtual paging on column layout
@@ -383,6 +450,9 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
   readonly bookContentElemRef = viewChild.required<ElementRef<HTMLDivElement>>('readingHtml');
   readonly readingContainer = viewChild.required('readingHtml', { read: ViewContainerRef });
 
+  // Off-screen element used to measure how many column-pages each section spans.
+  readonly measureContentElemRef = viewChild<ElementRef<HTMLDivElement>>('measureContent');
+
   readonly readingSectionElemRef = viewChild.required<ElementRef<HTMLDivElement>>('readingSection');
   readonly stickyTopElemRef = viewChild.required<ElementRef<HTMLDivElement>>('stickyTop');
   readonly reader = viewChild.required<ElementRef>('reader');
@@ -390,6 +460,9 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
 
 
   protected readonly layoutMode = this.readerSettingsService.layoutMode;
+  // In scroll mode a "page" is really a section, so the footer labels it accordingly.
+  protected readonly pageNumberLabelKey = computed(() =>
+    this.layoutMode() === BookPageLayoutMode.Default ? 'section-num-label' : 'page-num-label');
   protected readonly pageStyles = this.readerSettingsService.pageStyles;
   protected readonly immersiveMode = this.readerSettingsService.immersiveMode;
   protected readonly readingDirection = this.readerSettingsService.readingDirection;
@@ -400,7 +473,55 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
   protected columnHeight!: Signal<string>;
   protected verticalBookContentWidth!: Signal<string>;
   protected virtualizedPageNum!: Signal<number>;
+  private virtualizedPageNumRaw!: Signal<number>;
   protected virtualizedMaxPages!: Signal<number>;
+
+  // Signature of everything that affects a section's column-page count. Changing it forces a re-measure.
+  // Empty string when not in a column layout mode.
+  protected readonly columnLayoutKey = computed(() => {
+    const layoutMode = this.layoutMode();
+    if (layoutMode === BookPageLayoutMode.Default) return '';
+
+    const styles = this.pageStyles() ?? {};
+    return [
+      layoutMode,
+      this.writingStyle(),
+      this.columnWidth(),
+      this.columnHeight(),
+      this.pageSize(),
+      styles['font-size'],
+      styles['line-height'],
+      styles['font-family'],
+      styles['margin-left'],
+      styles['margin-right'],
+    ].join('|');
+  });
+
+  // translate() applied to the book content for column paging. 'none' in scroll mode.
+  protected readonly columnTransform = computed(() => {
+    if (this.layoutMode() === BookPageLayoutMode.Default) return 'none';
+    const offset = this.columnOffset();
+    return this.writingStyle() === WritingStyle.Vertical
+      ? `translateY(${-offset}px)`
+      : `translateX(${-offset}px)`;
+  });
+
+  // Columns visible per screen. Page numbers are counted per column.
+  protected readonly columnsPerScreen = computed(() => this.layoutMode() === BookPageLayoutMode.Column2 ? 2 : 1);
+
+  // 0-based screen index within the current section. Column offsets are always a multiple of the page size.
+  private readonly currentScreenIndex = computed(() => {
+    const pageSize = this.pageSize();
+    if (pageSize <= 0) return 0;
+    return Math.max(0, Math.round(this.columnOffset() / pageSize));
+  });
+
+  // 1-based book-wide start page of the current section, or null when there is no committed mapping.
+  private readonly columnBookWideSectionStart = computed<number | null>(() => {
+    if (this.layoutMode() === BookPageLayoutMode.Default) return null;
+    if (!this.columnMapService.hasCommitted(this.chapterId)) return null;
+    return this.columnMapService.committedStartPage(this.pageNum());
+  });
   protected bookContentPaddingBottom = computed(() => {
     const layoutMode = this.layoutMode();
     if (layoutMode !== BookPageLayoutMode.Default) return '0px';
@@ -605,12 +726,81 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
       return '';
     });
 
-    this.virtualizedPageNum = computed(() => {
-      return this.pageNum();
+    // Book-wide page number from the committed column mapping, or the raw section until the first pass commits.
+    // Value is 0-based (the template adds +1 for display).
+    this.virtualizedPageNumRaw = computed(() => {
+      if (this.layoutMode() === BookPageLayoutMode.Default) return this.pageNum();
+
+      // An explicit go-to-page target wins, so the exact page asked for is shown.
+      const override = this.displayPageOverride();
+      if (override !== null) return override - 1;
+
+      const sectionStart = this.columnBookWideSectionStart();
+      if (sectionStart === null) return this.pageNum();
+
+      // Leftmost visible column, from the committed counts and clamped to the section's real column count.
+      const perScreen = this.columnsPerScreen();
+      const sectionCount = this.columnMapService.committedSectionCount(this.pageNum());
+      let leftmostColumn = this.currentScreenIndex() * perScreen + 1;
+
+      if (sectionCount) {
+        leftmostColumn = Math.min(leftmostColumn, sectionCount);
+
+        // On the very last screen of the book show the final column.
+        const isLastSection = this.pageNum() === this.maxPages() - 1;
+        const isLastScreen = this.currentScreenIndex() >= Math.ceil(sectionCount / perScreen) - 1;
+        if (isLastSection && isLastScreen) return this.columnMapService.committedTotal() - 1;
+      }
+
+      return (sectionStart - 1) + (leftmostColumn - 1);
     });
 
+    // Hold the last settled value while a section loads, so the display never shows a mid-load transient.
+    this.virtualizedPageNum = this.holdDuringLoad(this.virtualizedPageNumRaw);
+    this.timeLeftDisplay = this.holdDuringLoad(this.timeLeftDisplayRaw);
+
     this.virtualizedMaxPages = computed(() => {
-      return this.maxPages();
+      if (this.layoutMode() === BookPageLayoutMode.Default) return this.maxPages();
+      if (this.columnBookWideSectionStart() === null) return this.maxPages();
+      return this.columnMapService.committedTotal();
+    });
+
+    // Re-measure the column mapping whenever the layout signature changes.
+    effect(() => {
+      this.columnLayoutKey();
+      this.scheduleColumnRemeasure();
+    });
+
+    // Mask the instant the layout mode changes. The settings handler that repositions and reveals is
+    // debounced, so without this the new layout would paint unmasked for a frame before it is set up.
+    let lastLayout = this.layoutMode();
+    effect(() => {
+      const layout = this.layoutMode();
+      if (layout === lastLayout) return;
+      lastLayout = layout;
+      this.hideForLayoutSwitch();
+    });
+
+    effect(() => {
+      const value = this.readingTimeLeftResource.value();
+      if (value !== undefined) this.lastTimeLeft.set(value);
+    });
+
+    effect(() => {
+      this.updateBookStyleSheet(this.pageStyles());
+    });
+
+    // Only surface the loading UI after a grace period, so quick loads don't flash the header/footer.
+    effect(() => {
+      this.clearTimeout(this.loadingUiTimeout);
+      if (this.isLoading()) {
+        this.loadingUiTimeout = setTimeout(() => {
+          this.showLoadingUi.set(true);
+          this.cdRef.markForCheck();
+        }, LOADING_GRACE);
+      } else {
+        this.showLoadingUi.set(false);
+      }
     });
 
     effect(() => {
@@ -815,6 +1005,9 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
       this.cdRef.markForCheck();
     }
 
+    this.updateVirtualPageState();
+    this.updateReadingFraction();
+
     // Find the element that is on screen to bookmark against
     const xpath: string | null | undefined = this.getFirstVisibleElementXPath();
     if (xpath !== null && xpath !== undefined) {
@@ -848,6 +1041,14 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
     this.clearTimeout(this.clickToPaginateVisualOverlayTimeout);
     this.clearTimeout(this.clickToPaginateVisualOverlayTimeout2);
     this.clearTimeout(this.delayedScrollEventTimeout);
+    this.clearTimeout(this.measureDebounceTimeout);
+    this.clearTimeout(this.loadingUiTimeout);
+    this.measureRunId++; // cancel any in-flight measuring pass
+    this.columnMapService.clear();
+    if (this.bookStyleSheet) {
+      this.bookStyleSheet.remove();
+      this.bookStyleSheet = undefined;
+    }
 
     this.readerService.disableWakeLock();
 
@@ -935,6 +1136,30 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
         tap(_ => this.onResize())
       )
       .subscribe();
+
+    fromEvent(this.document, 'visibilitychange')
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe(() => this.handleVisibilityChange());
+  }
+
+  // Mask while the tab is hidden, then restore the column position and reveal.
+  private handleVisibilityChange() {
+    if (this.layoutMode() === BookPageLayoutMode.Default) return;
+
+    const section = this.readingSectionElemRef()?.nativeElement;
+    if (!section) return;
+
+    if (this.document.hidden) {
+      this.maskedVirtualPage = this.currentVirtualPage();
+      this.maskReadingSection();
+      return;
+    }
+
+    if (this.bookContentElemRef() != null && this.maskedVirtualPage !== undefined) {
+      this.scrollToVirtualPage(this.maskedVirtualPage);
+    }
+    this.maskedVirtualPage = undefined;
+    requestAnimationFrame(() => this.unmaskReadingSection());
   }
 
   async init(firstLoad: boolean) {
@@ -990,6 +1215,9 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
     this.chapter = chapter;
     this.volumeId = chapter.volumeId;
     this.chapters = chapters;
+    // Drop the cached section html and column mapping from the previous chapter.
+    this.sectionHtmlCache.clear();
+    this.columnMapService.clear();
     this.maxPages.set(chapter.pages);
     this.setPageNum(progress.pageNum);
     this.cdRef.markForCheck();
@@ -1236,7 +1464,7 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
   async promptForPage() {
     const promptConfig = {...this.confirmService.defaultPrompt};
     promptConfig.header = translate('book-reader.go-to-page');
-    promptConfig.content = translate('book-reader.go-to-page-prompt', {totalPages: this.maxPages()});
+    promptConfig.content = translate('book-reader.go-to-page-prompt', {totalPages: this.bookWidePageEnabled() ? this.columnMapService.committedTotal() : this.maxPages()});
     promptConfig.bookReader = true;
 
     const goToPageNum = await this.confirmService.prompt(undefined, promptConfig);
@@ -1245,16 +1473,48 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
     return goToPageNum;
   }
 
+  // True when the footer shows a book-wide page number (column mode with a committed mapping).
+  private bookWidePageEnabled() {
+    return this.layoutMode() !== BookPageLayoutMode.Default && this.columnMapService.hasCommitted(this.chapterId);
+  }
+
   async goToPage(pageNum?: number) {
+    const prompted = pageNum === null || pageNum === undefined;
+
     let page = pageNum;
-    if (pageNum === null || pageNum === undefined) {
+    if (prompted) {
       const goToPageNum = await this.promptForPage();
       if (goToPageNum === null) { return; }
 
       page = parseInt(goToPageNum.trim(), 10) - 1; // -1 since the UI displays with a +1
     }
 
-    if (page === undefined || this.pageNum() === page) { return; }
+    if (page === undefined) { return; }
+
+    // A prompted value in column mode is a book-wide column, so map it to a section and the screen that
+    // holds that column.
+    if (prompted && this.bookWidePageEnabled()) {
+      const target = this.columnMapService.committedLocate(page + 1);
+      if (target === null) { return; }
+
+      const screen = Math.floor((target.column - 1) / this.columnsPerScreen()) + 1;
+
+      // Show the exact page asked for (which may be the right-hand column), not the screen's leftmost.
+      const startPage = this.columnMapService.committedStartPage(target.section);
+      if (startPage !== null) this.displayPageOverride.set(startPage + target.column - 1);
+
+      if (this.pageNum() === target.section) {
+        this.scrollToVirtualPage(screen);
+        return;
+      }
+
+      this.pendingVirtualPage = screen;
+      this.setPageNum(target.section);
+      this.loadPage();
+      return;
+    }
+
+    if (this.pageNum() === page) { return; }
 
     if (page > this.maxPages()) {
       page = this.maxPages();
@@ -1266,15 +1526,57 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
     this.loadPage();
   }
 
+  // Moves the current section to a 1-based column page.
+  private scrollToVirtualPage(virtualPage: number) {
+    this.setColumnOffset((virtualPage - 1) * this.pageSize());
+  }
+
+  // Instantly hides the reading content (no fade) so a reposition or reflow is not seen.
+  private maskReadingSection() {
+    const section = this.readingSectionElemRef()?.nativeElement;
+    if (section) this.renderer.setStyle(section, 'opacity', '0');
+  }
+
+  private unmaskReadingSection() {
+    const section = this.readingSectionElemRef()?.nativeElement;
+    if (section) this.renderer.removeStyle(section, 'opacity');
+  }
+
   loadPage(part?: string | undefined, scrollTop?: number | undefined) {
 
     this.isLoading.set(true);
     this.cdRef.markForCheck();
 
+    const isColumn = this.layoutMode() !== BookPageLayoutMode.Default;
+    const backward = this.pagingDirection === PAGING_DIRECTION.BACKWARDS;
+    const hasAnchor = (part !== undefined && part !== '') || (scrollTop !== undefined && scrollTop !== 0)
+      || (this.pendingVirtualPage !== undefined && this.pendingVirtualPage > 1);
+
+    // A forward turn lands at the start (offset 0). A backward turn lands on the last column, set instantly
+    // when the section has been measured.
+    let initialOffset = 0;
+    let instantBackward = false;
+    if (isColumn && backward && !hasAnchor) {
+      const count = this.columnMapService.committedSectionCount(this.pageNum());
+      if (count && this.pageSize() > 0) {
+        const lastScreen = Math.floor((count - 1) / this.columnsPerScreen());
+        initialOffset = lastScreen * this.pageSize();
+        instantBackward = true;
+      }
+    }
+
+    // Mask only when we can't position in the same pass as the content swap.
+    this.maskDuringLoad = isColumn && (hasAnchor || (backward && !instantBackward));
+
     this.bookService.getBookPage(this.chapterId, this.pageNum()).subscribe(content => {
+      this.sectionHtmlCache.set(this.pageNum(), content);
       this.isSingleImagePage = this.checkSingleImagePage(content); // This needs be performed before we set this.page to avoid image jumping
       this.updateSingleImagePageStyles();
 
+      if (this.maskDuringLoad) this.maskReadingSection();
+
+      // Set the offset in the same pass that swaps in the content, so it renders already positioned.
+      this.columnOffset.set(initialOffset);
       this.page.set(this.domSanitizer.bypassSecurityTrustHtml(content));
 
       this.scrollService.unlock();
@@ -1495,6 +1797,11 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
     this.annotationService.getAllAnnotations(this.chapterId).subscribe(_ => {
       this.setupAnnotationElements();
     });
+
+    // Sync footer state and ensure the column mapping exists for this layout.
+    this.updateVirtualPageState();
+    this.updateReadingFraction();
+    this.scheduleColumnRemeasure();
   }
 
   private scroll(lambda: () => void) {
@@ -1506,7 +1813,14 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
       setTimeout(() => {
         this.hasDelayedScroll = false;
         lambda();
-        afterFrame(() => this.handleScrollEvent());
+        afterFrame(() => {
+          this.handleScrollEvent();
+          // Lift the reposition mask once positioned.
+          if (this.maskDuringLoad) {
+            this.maskDuringLoad = false;
+            this.unmaskReadingSection();
+          }
+        });
       }, SCROLL_DELAY)
     });
   }
@@ -1537,27 +1851,23 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
       return;
     }
 
-    if (writingStyle === WritingStyle.Vertical) {
-      if (this.pagingDirection === PAGING_DIRECTION.BACKWARDS) {
-        //console.log('(Vertical) Scrolling via x axis to: ', this.bookContentElemRef.nativeElement.scrollHeight, ' via ', this.bookContentElemRef.nativeElement);
-        this.scroll(() => this.scrollService.scrollTo(this.bookContentElemRef().nativeElement.scrollHeight, this.bookContentElemRef().nativeElement, 'auto'));
+    // Landing on a specific column after jumping to a book-wide page.
+    if (this.pendingVirtualPage !== undefined) {
+      const virtualPage = this.pendingVirtualPage;
+      this.pendingVirtualPage = undefined;
+      if (virtualPage > 1) {
+        this.scroll(() => this.scrollToVirtualPage(virtualPage));
         return;
       }
-
-      //console.log('(Vertical) Scrolling via x axis to 0: ', 0, ' via ', this.bookContentElemRef.nativeElement);
-      this.scroll(() => this.scrollService.scrollTo(0, this.bookContentElemRef().nativeElement, 'auto'));
-      return;
     }
 
-    // We need to check if we are paging back, because we need to adjust the scroll
+    // Column mode: position by translating the content instead of scrolling the viewport.
     if (this.pagingDirection === PAGING_DIRECTION.BACKWARDS) {
-      //console.log('(Page Back) Scrolling via x axis to: ', this.bookContentElemRef.nativeElement.scrollWidth, ' via ', this.bookContentElemRef.nativeElement);
-      this.scroll(() => this.scrollService.scrollToX(this.bookContentElemRef().nativeElement.scrollWidth, this.bookContentElemRef().nativeElement));
+      this.scroll(() => this.setColumnOffset(this.lastColumnOffset(), false));
       return;
     }
 
-    //console.log('Scrolling via x axis to 0: ', 0, ' via ', this.bookContentElemRef.nativeElement);
-    this.scroll(() => this.scrollService.scrollToX(0, this.bookContentElemRef().nativeElement));
+    this.scroll(() => this.setColumnOffset(0, false));
   }
 
   private setupAnnotationElements() {
@@ -1628,6 +1938,7 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
   prevPage() {
     const oldPageNum = this.pageNum();
 
+    this.displayPageOverride.set(null);
     this.pagingDirection = PAGING_DIRECTION.BACKWARDS;
     const isColumnLayout = this.layoutMode() !== BookPageLayoutMode.Default;
 
@@ -1636,25 +1947,7 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
       const [currentVirtualPage, _, pageSize] = this.getVirtualPage();
 
       if (currentVirtualPage > 1) {
-        // Calculate the target scroll position for the previous page
-        const targetScroll = (currentVirtualPage - 2) * pageSize;
-
-        const isVertical = this.writingStyle() === WritingStyle.Vertical;
-
-        // -2 apparently goes back 1 virtual page...
-        const scrollMethod = isVertical ? 'scrollTo' : 'scrollToX';
-        this.scrollService[scrollMethod](
-          targetScroll,
-          this.bookContentElemRef().nativeElement,
-          'auto',
-          () => {
-            this.handleScrollEvent();
-          },
-          {
-            tolerance: 3,
-            timeout: 2000
-          }
-        );
+        this.setColumnOffset((currentVirtualPage - 2) * pageSize);
         return;
       }
     }
@@ -1680,6 +1973,7 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
       event.preventDefault();
     }
 
+    this.displayPageOverride.set(null);
     this.pagingDirection = PAGING_DIRECTION.FORWARD;
 
 
@@ -1688,25 +1982,7 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
       const [currentVirtualPage, totalVirtualPages, pageSize] = this.getVirtualPage();
 
       if (currentVirtualPage < totalVirtualPages) {
-
-        // Calculate the target scroll position for the next page
-        const targetScroll = (currentVirtualPage * pageSize);
-        const isVertical = this.writingStyle() === WritingStyle.Vertical;
-
-        // +0 apparently goes forward 1 virtual page...
-        const scrollMethod = isVertical ? 'scrollTo' : 'scrollToX';
-        this.scrollService[scrollMethod](
-          targetScroll,
-          this.bookContentElemRef().nativeElement,
-          'auto',
-          () => {
-            this.handleScrollEvent();
-          },
-          {
-            tolerance: 3,
-            timeout: 2000
-          }
-        );
+        this.setColumnOffset(currentVirtualPage * pageSize);
         return;
       }
     }
@@ -1805,14 +2081,30 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   private getScrollOffsetAndTotalScroll() {
-    const { nativeElement: bookContent } = this.bookContentElemRef();
-    const scrollOffset = this.writingStyle() === WritingStyle.Vertical
-        ? bookContent.scrollTop
-        : bookContent.scrollLeft;
-    const totalScroll = this.writingStyle() === WritingStyle.Vertical
-        ? bookContent.scrollHeight
-        : bookContent.scrollWidth;
-    return [scrollOffset, totalScroll];
+    return [this.columnOffset(), this.columnContentTotal()];
+  }
+
+  // Full length of the columned content along the paging axis.
+  private columnContentTotal(): number {
+    const bookContent = this.bookContentElemRef()?.nativeElement;
+    if (!bookContent) return 0;
+    return this.writingStyle() === WritingStyle.Vertical ? bookContent.scrollHeight : bookContent.scrollWidth;
+  }
+
+  // Offset of the last column page.
+  private lastColumnOffset(): number {
+    const pageSize = this.pageSize();
+    if (pageSize <= 0) return 0;
+    const totalVirtualPages = Math.max(1, Math.ceil(this.columnContentTotal() / pageSize));
+    return (totalVirtualPages - 1) * pageSize;
+  }
+
+  // Moves the columned content to an offset by translating it. notify runs the progress/state update.
+  private setColumnOffset(offset: number, notify: boolean = true) {
+    const clamped = Math.min(Math.max(0, Math.round(offset)), this.lastColumnOffset());
+    this.columnOffset.set(clamped);
+    this.cdRef.markForCheck();
+    if (notify) this.handleScrollEvent();
   }
 
   pageSize = computed(() => {
@@ -1824,6 +2116,259 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
       ? height
       : width;
   });
+
+  // Returns a signal that mirrors source while settled and holds the last settled value during a load.
+  private holdDuringLoad<T>(source: Signal<T>): Signal<T> {
+    const held = signal<T>(source());
+    effect(() => {
+      const value = source();
+      if (!this.isLoading()) held.set(value);
+    });
+    return computed(() => this.isLoading() ? held() : source());
+  }
+
+  // Tracks the current screen, used for restoring position.
+  private updateVirtualPageState() {
+    if (this.layoutMode() === BookPageLayoutMode.Default) return;
+    if (this.bookContentElemRef() == null) return;
+
+    const [currentVirtualPage] = this.getVirtualPage();
+    this.currentVirtualPage.set(currentVirtualPage);
+  }
+
+  // Recomputes readingFraction from the current position: the section index plus its intra-section fraction.
+  private updateReadingFraction() {
+    const maxPages = this.maxPages();
+    if (maxPages <= 0) { this.readingFraction.set(0); return; }
+
+    let intra = 0;
+    if (this.layoutMode() !== BookPageLayoutMode.Default) {
+      const scrollable = this.columnContentTotal() - this.pageSize();
+      if (scrollable > 0) intra = this.columnOffset() / scrollable;
+    } else {
+      const reader = this.reader()?.nativeElement;
+      if (reader) {
+        if (this.writingStyle() === WritingStyle.Vertical) {
+          const scrollable = reader.scrollWidth - reader.clientWidth;
+          if (scrollable > 0) intra = Math.abs(reader.scrollLeft) / scrollable;
+        } else {
+          const scrollable = reader.scrollHeight - reader.clientHeight;
+          if (scrollable > 0) intra = reader.scrollTop / scrollable;
+        }
+      }
+    }
+
+    intra = Math.min(1, Math.max(0, intra));
+    this.readingFraction.set(Math.min(1, Math.max(0, (this.pageNum() + intra) / maxPages)));
+  }
+
+  private scheduleColumnRemeasure() {
+    this.clearTimeout(this.measureDebounceTimeout);
+    this.measureDebounceTimeout = setTimeout(() => this.remeasureColumns(), MEASURE_DEBOUNCE);
+  }
+
+  // Measures every section of the book at the current layout, then commits the mapping in one go.
+  private async remeasureColumns() {
+    const layoutKey = this.columnLayoutKey();
+
+    if (this.layoutMode() === BookPageLayoutMode.Default || layoutKey === '') {
+      this.measureRunId++;
+      this.columnMapService.clear();
+      return;
+    }
+
+    if (this.columnMapService.isMeasured(this.chapterId, layoutKey) && this.columnMapService.isComplete()) {
+      this.updateVirtualPageState();
+      if (!this.columnMapService.hasCommitted(this.chapterId)) this.columnMapService.commit();
+      return;
+    }
+
+    const maxPages = this.maxPages();
+    if (maxPages <= 0 || this.pageSize() <= 0 || this.measureContentElemRef() == null) return;
+
+    if (!this.columnMapService.isMeasured(this.chapterId, layoutKey)) {
+      this.columnMapService.reset(this.chapterId, maxPages, layoutKey);
+    }
+
+    const runId = ++this.measureRunId;
+    this.columnMapService.setMeasuring(true);
+    this.updateVirtualPageState();
+
+    // Mirror the live content box onto the measure element once for the whole pass.
+    this.prepareMeasureElement();
+
+    const sections: number[] = [];
+    const counts = this.columnMapService.counts();
+    for (let s = 0; s < maxPages; s++) {
+      if ((counts[s] ?? 0) === 0) sections.push(s);
+    }
+
+    await this.fetchAndMeasureSections(sections, runId, layoutKey);
+    if (runId !== this.measureRunId || !this.columnMapService.isMeasured(this.chapterId, layoutKey)) return;
+
+    this.columnMapService.setMeasuring(false);
+    this.columnMapService.commit();
+  }
+
+  // Fetches sections in parallel and measures each as it arrives.
+  private async fetchAndMeasureSections(sections: number[], runId: number, layoutKey: string) {
+    const queue = [...sections];
+    const aborted = () => runId !== this.measureRunId || !this.columnMapService.isMeasured(this.chapterId, layoutKey);
+
+    const worker = async () => {
+      while (queue.length) {
+        if (aborted()) return;
+
+        const section = queue.shift()!;
+        let html: string | undefined;
+        try {
+          html = await this.fetchSectionHtml(section);
+        } catch {
+          html = undefined;
+        }
+        if (aborted()) return;
+
+        // A section measured live in the meantime is left as-is.
+        if ((this.columnMapService.counts()[section] ?? 0) > 0) continue;
+        this.columnMapService.setCount(section, html === undefined ? 1 : this.measureColumnsForHtml(html));
+      }
+    };
+
+    const workers = Array.from({length: Math.min(MEASURE_CONCURRENCY, sections.length)}, () => worker());
+    await Promise.all(workers);
+  }
+
+  private fetchSectionHtml(section: number): Promise<string> {
+    const cached = this.sectionHtmlCache.get(section);
+    if (cached !== undefined) return Promise.resolve(cached);
+
+    return firstValueFrom(this.bookService.getBookPage(this.chapterId, section))
+      .then(html => {
+        this.sectionHtmlCache.set(section, html);
+        return html;
+      });
+  }
+
+  // Mirrors the live content box onto the measure element so its column flow matches the reader. The values
+  // are constant for a measurement pass, so this runs once per pass rather than per section.
+  private prepareMeasureElement() {
+    const measureRef = this.measureContentElemRef();
+    const bookContentRef = this.bookContentElemRef();
+    if (measureRef == null || bookContentRef == null) return;
+
+    const el = measureRef.nativeElement;
+    const real = bookContentRef.nativeElement;
+
+    const cs = getComputedStyle(real);
+    for (const prop of MEASURE_MIRRORED_STYLES) {
+      this.renderer.setStyle(el, prop, cs.getPropertyValue(prop));
+    }
+    // clientWidth/clientHeight are the padding box, so border-box plus the mirrored padding keeps the
+    // content box identical to the live element.
+    this.renderer.setStyle(el, 'box-sizing', 'border-box');
+    this.renderer.setStyle(el, 'width', real.clientWidth + 'px');
+    this.renderer.setStyle(el, 'height', real.clientHeight + 'px');
+    this.renderer.setStyle(el, 'max-height', real.clientHeight + 'px');
+  }
+
+  // Lays a section out in the (already prepared) off-screen element and returns how many column-pages it occupies.
+  private measureColumnsForHtml(html: string): number {
+    const measureRef = this.measureContentElemRef();
+    if (measureRef == null || this.pageSize() <= 0) return 1;
+
+    const el = measureRef.nativeElement;
+
+    // Strip embedded style/link so a measured section can never restyle the visible page.
+    el.innerHTML = this.stripStyleTags(html);
+    // Element-level styles are applied per child in the live reader, so mirror that here.
+    this.applyElementLevelStylesTo(el);
+
+    const scroll = this.writingStyle() === WritingStyle.Vertical ? el.scrollHeight : el.scrollWidth;
+    const count = this.columnsForScroll(scroll);
+
+    el.innerHTML = '';
+    return count;
+  }
+
+  // Converts a content extent into the number of column pages, excluding any blank column padding the last
+  // screen (so end-of-chapter blanks aren't counted).
+  private columnsForScroll(scroll: number): number {
+    const pageSize = this.pageSize();
+    if (pageSize <= 0) return 1;
+
+    const perScreen = this.columnsPerScreen();
+    const advance = pageSize / perScreen;
+    const fullScreens = Math.floor(scroll / pageSize);
+    const remainder = scroll - fullScreens * pageSize;
+    const columnsInLastScreen = remainder > 1 ? Math.min(perScreen, Math.ceil(remainder / advance)) : 0;
+
+    return Math.max(1, fullScreens * perScreen + columnsInLastScreen);
+  }
+
+  private stripStyleTags(html: string): string {
+    return html
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<link\b[^>]*>/gi, '');
+  }
+
+  // Moves the horizontal reading margins onto the clip container in column mode (and clears them on the
+  // translated content). In scroll mode the margins stay on the content.
+  private relocateColumnMargins() {
+    const container = this.bookContainerElemRef().nativeElement;
+    const content = this.bookContentElemRef().nativeElement;
+    const sides = ['margin-left', 'margin-right'];
+
+    if (this.layoutMode() === BookPageLayoutMode.Default) {
+      sides.forEach(prop => this.renderer.removeStyle(container, prop));
+      return;
+    }
+
+    sides.forEach(prop => {
+      const applied = content.style.getPropertyValue(prop);
+      if (applied) {
+        this.renderer.setStyle(container, prop, applied, RendererStyleFlags2.Important);
+      } else {
+        this.renderer.removeStyle(container, prop);
+      }
+      this.renderer.setStyle(content, prop, '0px', RendererStyleFlags2.Important);
+    });
+  }
+
+  // Maintains the persistent stylesheet for element-level styles so they apply the moment content renders.
+  private updateBookStyleSheet(pageStyles: PageStyle | undefined) {
+    if (!this.bookStyleSheet) {
+      this.bookStyleSheet = this.renderer.createElement('style');
+      this.renderer.appendChild(this.document.head, this.bookStyleSheet);
+    }
+
+    const styles = (pageStyles ?? {}) as Record<string, string | undefined>;
+    const declarations = elementLevelStyles
+      .map(prop => ({prop, value: styles[prop]}))
+      .filter(({value}) => value !== undefined && value !== '' && value !== '100%' && value !== '0px' && value !== 'inherit')
+      .map(({prop, value}) => `${prop}: ${value} !important;`)
+      .join(' ');
+
+    this.bookStyleSheet!.textContent = declarations ? `.book-content > *:not(style) { ${declarations} }` : '';
+  }
+
+  private applyElementLevelStylesTo(container: HTMLElement) {
+    const styles = this.pageStyles() ?? {};
+    const entries = Object.entries(styles).filter(item => elementLevelStyles.includes(item[0]));
+    if (entries.length === 0) return;
+
+    for (let i = 0; i < container.children.length; i++) {
+      const elem = container.children.item(i);
+      if (!elem || elem.tagName === 'STYLE') continue;
+
+      entries.forEach(item => {
+        if (item[1] == '100%' || item[1] == '0px' || item[1] == 'inherit') {
+          this.renderer.removeStyle(elem, item[0]);
+          return;
+        }
+        this.renderer.setStyle(elem, item[0], item[1], RendererStyleFlags2.Important);
+      });
+    }
+  }
 
 
   getFirstVisibleElementXPath() {
@@ -2021,7 +2566,7 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
       }
     });
 
-
+    this.relocateColumnMargins();
 
     const individualElementStyles = Object.entries(pageStyles).filter(item => elementLevelStyles.includes(item[0]));
     for(let i = 0; i < bookContentElemRef.nativeElement.children.length; i++) {
@@ -2152,13 +2697,19 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
     const writingStyle = this.writingStyle();
 
     if (layout !== BookPageLayoutMode.Default) {
+      // Translate to the column page that contains the element. Both rects carry the same transform, so
+      // their difference is the element's layout offset regardless of the current position.
       afterFrame(() => {
-        // scrollIntoView method will only scroll to the visible area of the element (not including margin)
-        // so we need to apply scroll-margin to that element to correctly scroll into it
-        let margin = window.getComputedStyle(element).margin;
-        if(margin !== '0px') element.style.scrollMargin = margin;
+        const pageSize = this.pageSize();
+        if (pageSize <= 0) return;
 
-        this.scrollService.scrollIntoView(element, {timeout, scrollIntoViewOptions: {'block': 'start', 'inline': 'start'}})
+        const contentRect = this.bookContentElemRef().nativeElement.getBoundingClientRect();
+        const elemRect = element.getBoundingClientRect();
+        const within = writingStyle === WritingStyle.Vertical
+          ? (elemRect.top - contentRect.top)
+          : (elemRect.left - contentRect.left);
+
+        this.setColumnOffset(Math.max(0, Math.floor(within / pageSize)) * pageSize);
       });
       return;
     }
@@ -2226,6 +2777,12 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
   }
 
   applyLayoutMode(mode: BookPageLayoutMode, isChange: boolean = false) {
+    if (isChange) {
+      // Content was masked by the layout-mode effect. Reposition and relocate margins while hidden.
+      this.columnOffset.set(0);
+      this.applyPageStyles(this.pageStyles());
+    }
+
     this.clearTimeout(this.updateImageSizeTimeout);
     this.updateImageSizeTimeout = setTimeout( () => {
       this.updateImageSizes();
@@ -2253,9 +2810,34 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
     });
 
     const lastSelector = this.lastSeenScrollPartPath;
-    if (isChange && lastSelector !== '') {
-      setTimeout(() => this.scrollTo(lastSelector), SCROLL_DELAY);
+    if (isChange) {
+      if (lastSelector !== '') {
+        setTimeout(() => {
+          this.scrollTo(lastSelector);
+          this.revealAfterLayoutSwitch();
+        }, SCROLL_DELAY);
+      } else {
+        this.revealAfterLayoutSwitch();
+      }
     }
+  }
+
+  // Hide instantly (fade transition disabled) for the duration of a layout switch.
+  private hideForLayoutSwitch() {
+    const section = this.readingSectionElemRef()?.nativeElement;
+    if (!section) return;
+    this.renderer.setStyle(section, 'transition', 'none');
+    this.maskReadingSection();
+  }
+
+  // Reveal once the new layout is measured and repositioned.
+  private revealAfterLayoutSwitch() {
+    const section = this.readingSectionElemRef()?.nativeElement;
+    if (!section) return;
+    afterFrame(() => requestAnimationFrame(() => {
+      this.unmaskReadingSection();
+      requestAnimationFrame(() => this.renderer.removeStyle(section, 'transition'));
+    }));
   }
 
   applyImmersiveMode(immersiveMode: boolean) {
@@ -2392,6 +2974,9 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
     const mouseOffset = 5;
 
     if (!this.immersiveMode()) return;
+
+    // Don't toggle when the click was clearing a selection, or when text is currently selected.
+    if (this.hadSelectionOnMouseDown || (window.getSelection()?.toString().trim() ?? '') !== '') return;
     if (targetElement.getAttribute('onclick') !== null || targetElement.getAttribute('href') !== null || targetElement.getAttribute('role') !== null || targetElement.getAttribute('kavita-part') != null) {
       // Don't do anything, it's actionable
       return;
@@ -2407,6 +2992,8 @@ export class BookReaderComponent implements OnInit, AfterViewInit, OnDestroy {
 
   mouseDown($event: MouseEvent) {
     this.mousePosition = {x: $event.clientX, y: $event.clientY};
+    // Capture selection state before mousedown collapses it, so a click that clears a selection doesn't toggle the menu.
+    this.hadSelectionOnMouseDown = (window.getSelection()?.toString().trim() ?? '') !== '';
   }
 
   refreshPersonalToC() {
